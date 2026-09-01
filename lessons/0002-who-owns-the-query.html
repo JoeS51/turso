@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Who Owns the Query?</title>
+  <link rel="stylesheet" href="../assets/course.css">
+  <script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Lesson 2 · 10 minutes · code ownership</p>
+    <h1>Who owns the query?</h1>
+    <p class="dek">Turn your correct request-pipeline model into a code map: which component calls the next one, and what data crosses each boundary?</p>
+  </header>
+
+  <section class="callout" aria-labelledby="model-title">
+    <h2 id="model-title">Your Model, Tightened</h2>
+    <p>Your model is right:</p>
+    <p><code>PG bytes → SQL → PG AST → Turso AST → VDBE → Turso rows → PG responses</code></p>
+    <p>One correction matters: <code>cli/main.rs</code> does not call <code>do_query</code>. It starts server mode. The pgwire crate later calls <code>do_query</code> when a client sends a simple-query message.</p>
+  </section>
+
+  <section aria-labelledby="fork-title">
+    <h2 id="fork-title">First: The Binary Has Two Paths</h2>
+    <p><code>tursopg</code> is one binary with two relevant modes. Both open Turso with PostgreSQL behavior, but only one speaks the PostgreSQL wire protocol.</p>
+    <table class="trace">
+      <thead><tr><th>Mode</th><th>Who supplies SQL?</th><th>Uses pgwire?</th><th>Calls <code>do_query</code>?</th></tr></thead>
+      <tbody>
+        <tr><td>Interactive shell or <code>-q</code></td><td>The built-in CLI</td><td>No</td><td>No</td></tr>
+        <tr><td><code>--server 127.0.0.1:5432</code></td><td>An external client such as <code>psql</code></td><td>Yes</td><td>pgwire does</td></tr>
+      </tbody>
+    </table>
+    <p>See the fork in <a href="../postgres/cli/main.rs#L1024"><code>postgres/cli/main.rs:1024-1035</code></a>. Server mode constructs <code>TursoPgServer</code> and returns from the CLI path; otherwise the binary continues into direct command or interactive execution.</p>
+  </section>
+
+  <section aria-labelledby="control-title">
+    <h2 id="control-title">The Server-Mode Control Flow</h2>
+    <ol class="pipeline">
+      <li><strong>CLI launches</strong><span><code>TursoPgServer::new</code><br>then <code>run</code></span></li>
+      <li><strong>Server accepts</strong><span>Tokio accepts a TCP socket</span></li>
+      <li><strong>pgwire decodes</strong><span><code>process_socket</code> reads PG messages</span></li>
+      <li><strong>Handler runs</strong><span>pgwire calls Turso's <code>do_query</code></span></li>
+      <li><strong>Core executes</strong><span>frontend prepares; core runs</span></li>
+    </ol>
+
+    <p><strong>1. The CLI launches a server.</strong></p>
+    <pre><code>// postgres/cli/main.rs
+if let Some(ref address) = opts.server {
+    let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+    return server.run();
+}</code></pre>
+
+    <p><strong>2. The server gives each socket to pgwire.</strong></p>
+    <pre><code>// postgres/server/lib.rs
+let (socket, addr) = listener.accept().await?;
+tokio::spawn(async move {
+    process_socket(socket, None, factory_ref).await
+});</code></pre>
+    <p><a href="../postgres/server/lib.rs#L55"><code>run_async</code></a> owns listening and connection acceptance. <code>process_socket</code> belongs to pgwire; it owns PostgreSQL frame decoding and encoding.</p>
+
+    <p><strong>3. The factory tells pgwire which Turso callbacks to invoke.</strong></p>
+    <pre><code>// postgres/server/lib.rs
+fn simple_query_handler(&amp;self) -&gt; Arc&lt;impl SimpleQueryHandler&gt; {
+    self.handler.clone()
+}</code></pre>
+    <p><a href="../postgres/server/lib.rs#L156"><code>TursoPgFactory</code></a> connects pgwire's protocol machinery to <code>TursoPgHandler</code>. This is callback registration: Turso does not call <code>do_query</code>; pgwire calls it.</p>
+  </section>
+
+  <section aria-labelledby="data-title">
+    <h2 id="data-title">The Data Changes Shape</h2>
+    <table class="trace">
+      <thead><tr><th>Artifact</th><th>Owner</th><th>Code landmark</th></tr></thead>
+      <tbody>
+        <tr><td>Raw PostgreSQL bytes</td><td>pgwire</td><td><code>process_socket</code></td></tr>
+        <tr><td>SQL <code>&amp;str</code></td><td>server handler</td><td><a href="../postgres/server/lib.rs#L174"><code>SimpleQueryHandler::do_query</code></a></td></tr>
+        <tr><td><code>pg_query::ParseResult</code></td><td>parser wrapper</td><td><a href="../postgres/parser/lib.rs#L12"><code>turso_pg_parser::parse</code></a></td></tr>
+        <tr><td><code>turso_parser::ast::Cmd</code></td><td>translator</td><td><a href="../postgres/parser/translator.rs#L114"><code>translate_with_prereqs</code></a></td></tr>
+        <tr><td><code>turso_core::Statement</code></td><td>core compiler</td><td><a href="../postgres/frontend/session.rs#L206"><code>prepare_translated_cmd_with_options</code></a></td></tr>
+        <tr><td>Turso <code>Row</code> values</td><td>core executor</td><td><a href="../postgres/server/lib.rs#L384"><code>run_with_row_callback</code></a></td></tr>
+        <tr><td>pgwire <code>Response</code></td><td>server encoder</td><td><code>execute_query</code> or <code>execute_non_query</code></td></tr>
+        <tr><td>Raw PostgreSQL bytes</td><td>pgwire</td><td>after the callback returns</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="prepare-title">
+    <h2 id="prepare-title">What “Prepare” Means Here</h2>
+    <p>At <a href="../postgres/frontend/session.rs#L169"><code>prepare_statement</code></a>, the SQL has already left the protocol layer. This function coordinates PostgreSQL compatibility:</p>
+    <ol>
+      <li>Handle frontend-only statements such as <code>SET</code>, <code>SHOW</code>, schemas, and file-based <code>COPY</code>.</li>
+      <li>Ask <code>pg_query</code> for PostgreSQL's parsed protobuf AST.</li>
+      <li>Ask <code>PostgreSQLTranslator</code> for Turso's AST.</li>
+      <li>Pass that Turso command and session options into core.</li>
+    </ol>
+    <p>Core then compiles the Turso AST into the VDBE program stored in a <code>Statement</code>. Later, <code>execute_query</code> or <code>execute_non_query</code> runs that statement.</p>
+  </section>
+
+  <section aria-labelledby="return-title">
+    <h2 id="return-title">The Return Trip</h2>
+    <p>The phrase “server translates the Turso response” is close, but the exact flow is:</p>
+    <pre><code>Turso Statement yields Value objects
+  → server chooses PostgreSQL field OIDs
+  → server encodes values into DataRow objects
+  → server returns pgwire Response objects
+  → pgwire serializes PostgreSQL response bytes</code></pre>
+    <p>The server owns semantic mapping, such as deciding that a Turso integer column should be PostgreSQL <code>INT4</code>. pgwire owns the final protocol framing.</p>
+    <p class="source"><span class="source-label">Primary source</span><br>Compare this implementation with PostgreSQL's specified <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY">simple-query response sequence</a>: <code>RowDescription</code>, zero or more <code>DataRow</code> messages, <code>CommandComplete</code>, then <code>ReadyForQuery</code>.</p>
+  </section>
+
+  <section class="exercise" data-quiz data-explanation="pg_query has finished PostgreSQL parsing; the translator now converts that PostgreSQL AST into Turso's AST." aria-labelledby="quiz-title">
+    <h2 id="quiz-title">Boundary Check</h2>
+    <p><code>pg_query</code> successfully parses a statement, but Turso reports that its PostgreSQL node is unsupported. Which layer do you inspect first?</p>
+    <div class="quiz-options">
+      <button type="button" data-answer="correct">Postgres translator layer</button>
+      <button type="button" data-answer="wrong">pgwire protocol layer</button>
+      <button type="button" data-answer="wrong">Turso execution layer</button>
+      <button type="button" data-answer="wrong">CLI startup layer</button>
+    </div>
+    <p class="feedback" data-feedback aria-live="polite"></p>
+  </section>
+
+  <section aria-labelledby="tour-title">
+    <h2 id="tour-title">A Focused Code Tour</h2>
+    <p>Read only these slices, in this order. At each stop, identify the artifact entering and leaving.</p>
+    <ol>
+      <li><a href="../postgres/cli/main.rs#L1024"><code>postgres/cli/main.rs:1024-1035</code></a>: choose server or direct CLI mode.</li>
+      <li><a href="../postgres/server/lib.rs#L55"><code>postgres/server/lib.rs:55-100</code></a>: accept sockets and enter pgwire.</li>
+      <li><a href="../postgres/server/lib.rs#L156"><code>postgres/server/lib.rs:156-205</code></a>: register and run the simple-query callback.</li>
+      <li><a href="../postgres/frontend/session.rs#L169"><code>postgres/frontend/session.rs:169-209</code></a>: parse, translate, and cross into core.</li>
+      <li><a href="../postgres/parser/translator.rs#L114"><code>postgres/parser/translator.rs:114-181</code></a>: dispatch PostgreSQL AST nodes.</li>
+      <li><a href="../postgres/server/lib.rs#L384"><code>postgres/server/lib.rs:384-418</code></a>: run and return pgwire responses.</li>
+    </ol>
+    <p>Do not read each whole file yet. The translator alone is thousands of lines; first learn its boundary and dispatch shape.</p>
+  </section>
+
+  <section class="source" aria-labelledby="teach-back-title">
+    <h2 id="teach-back-title">Teach It Back</h2>
+    <p>Without looking above, answer: who calls <code>do_query</code>, what enters <code>prepare_statement</code>, what leaves the translator, and who turns response objects into bytes?</p>
+    <p>Send your answer to your teaching agent. Questions are welcome, especially where “frontend,” “server,” and “core” still feel like overlapping names.</p>
+  </section>
+
+  <nav aria-label="Course navigation">
+    <a href="0001-trace-a-simple-query.html">Previous: trace one query</a>
+    <a href="../reference/postgres-frontend-map.html">Quick reference</a>
+    <a href="../RESOURCES.md">Trusted resources</a>
+  </nav>
+</main>
+</body>
+</html>

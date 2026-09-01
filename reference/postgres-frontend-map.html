@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Turso PostgreSQL Frontend Map</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Quick reference · source map</p>
+    <h1>PostgreSQL frontend map</h1>
+    <p class="dek">Use this page to decide where a bug belongs before editing code.</p>
+  </header>
+
+  <section aria-labelledby="pipeline-title">
+    <h2 id="pipeline-title">One Request, Five Boundaries</h2>
+    <ol class="pipeline">
+      <li><strong>Wire</strong><span><code>postgres/server</code><br>TCP and pgwire handlers</span></li>
+      <li><strong>Session</strong><span><code>postgres/frontend</code><br>PG-aware preparation</span></li>
+      <li><strong>Translation</strong><span><code>postgres/parser</code><br>PG AST to Turso AST</span></li>
+      <li><strong>Execution</strong><span><code>core</code><br>compile and run VDBE</span></li>
+      <li><strong>Encoding</strong><span><code>postgres/server</code><br>types, rows, tags, errors</span></li>
+    </ol>
+  </section>
+
+  <section aria-labelledby="locator-title">
+    <h2 id="locator-title">Change Locator</h2>
+    <table class="trace">
+      <thead><tr><th>Symptom</th><th>Start here</th><th>Narrow test</th></tr></thead>
+      <tbody>
+        <tr><td>Client cannot connect or reads wrong frames</td><td><a href="../postgres/server/lib.rs"><code>postgres/server/lib.rs</code></a></td><td><a href="../postgres/cli/tests/tursopg.rs"><code>postgres/cli/tests/tursopg.rs</code></a></td></tr>
+        <tr><td><code>SET</code>, <code>SHOW</code>, schema, or file <code>COPY</code> behavior</td><td><a href="../postgres/frontend/session.rs"><code>postgres/frontend/session.rs</code></a></td><td><code>postgres/tests/integration</code></td></tr>
+        <tr><td>Valid PostgreSQL syntax is unsupported or translated wrongly</td><td><a href="../postgres/parser/translator.rs"><code>postgres/parser/translator.rs</code></a></td><td><code>postgres/parser/tests</code> then conformance</td></tr>
+        <tr><td>Correct query, wrong result value</td><td><code>core/translate</code> or <code>core/vdbe</code></td><td><a href="../postgres/conformance/pg-sqltests/"><code>postgres/conformance/pg-sqltests</code></a></td></tr>
+        <tr><td>Correct value, wrong OID or text/binary form</td><td><a href="../postgres/server/lib.rs"><code>build_field_info</code>, <code>encode_value</code></a></td><td>Raw wire test in <code>tursopg.rs</code></td></tr>
+        <tr><td>Wrong affected-row count or command tag</td><td><a href="../postgres/server/lib.rs"><code>execute_non_query</code>, <code>command_tag</code></a></td><td>Raw wire or PG conformance test</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="trace-title">
+    <h2 id="trace-title"><code>SELECT 42</code> Call Trace</h2>
+    <table class="trace">
+      <thead><tr><th>Step</th><th>Code</th><th>Artifact crossing boundary</th></tr></thead>
+      <tbody>
+        <tr><td>Accept</td><td><code>TursoPgServer::run_async</code> → <code>process_socket</code></td><td>TCP bytes</td></tr>
+        <tr><td>Dispatch</td><td><code>SimpleQueryHandler::do_query</code></td><td>SQL string</td></tr>
+        <tr><td>Prepare</td><td><code>PgConnection::prepare</code> → <code>prepare_statement</code></td><td>PostgreSQL-aware statement request</td></tr>
+        <tr><td>Parse</td><td><code>turso_pg_parser::parse</code></td><td><code>pg_query::ParseResult</code></td></tr>
+        <tr><td>Translate</td><td><code>PostgreSQLTranslator::translate_with_prereqs</code></td><td><code>turso_parser::ast::Cmd</code></td></tr>
+        <tr><td>Compile</td><td><code>prepare_translated_cmd_with_options</code></td><td><code>turso_core::Statement</code></td></tr>
+        <tr><td>Describe</td><td><code>build_field_info</code></td><td>PostgreSQL field names, OIDs, formats</td></tr>
+        <tr><td>Run</td><td><code>execute_query</code> → <code>run_with_row_callback</code></td><td>Turso rows</td></tr>
+        <tr><td>Encode</td><td><code>encode_value</code> → <code>QueryResponse</code></td><td>pgwire response objects</td></tr>
+        <tr><td>Emit</td><td>pgwire</td><td><code>T</code>, <code>D</code>, <code>C</code>, <code>Z</code> frames</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section aria-labelledby="terms-title">
+    <h2 id="terms-title">Working Glossary</h2>
+    <p><strong>Wire layer.</strong> The code that accepts PostgreSQL protocol messages and builds protocol responses. In this repository, mainly <code>postgres/server</code> plus the pgwire dependency.</p>
+    <p><strong>Frontend layer.</strong> The PostgreSQL compatibility code between a client and Turso core. It includes server, session, parser, translator, catalogs, aliases, and PostgreSQL-specific tests.</p>
+    <p><strong>Translator.</strong> Converts the protobuf AST produced by PostgreSQL's parser into Turso's parser AST. It is not the query planner.</p>
+    <p><strong>Core boundary.</strong> The call that hands a translated <code>ast::Cmd</code> to Turso core and receives a compiled <code>Statement</code>.</p>
+    <p><strong>Command tag.</strong> The string in <code>CommandComplete</code>, such as <code>SELECT 1</code> or <code>INSERT 0 3</code>.</p>
+  </section>
+
+  <section class="callout" aria-labelledby="watch-title">
+    <h2 id="watch-title">Compatibility Watchpoints</h2>
+    <p>The current simple-query handler buffers encoded rows before returning a response. It also executes split statements one by one rather than adding PostgreSQL's implicit transaction around a multi-statement simple query. Treat these as observed implementation facts, not as desired protocol semantics; compare behavior with the <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY">PostgreSQL simple-query specification</a> before changing related code.</p>
+  </section>
+
+  <nav aria-label="Course navigation">
+    <a href="../lessons/0001-trace-a-simple-query.html">Lesson 1: trace a simple query</a>
+    <a href="../lessons/0002-who-owns-the-query.html">Lesson 2: who owns the query?</a>
+    <a href="../RESOURCES.md">Course resources</a>
+  </nav>
+</main>
+</body>
+</html>

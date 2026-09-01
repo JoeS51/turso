@@ -694,6 +694,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
         Tag::new("COMMENT")
+    } else if upper.starts_with("SHOW") {
+        Tag::new("SHOW")
     } else if upper.starts_with("SELECT") || upper.starts_with("WITH") {
         // Row-returning SELECTs never reach command_tag (they take the
         // query-response path), so a zero-column SELECT- or WITH-prefixed

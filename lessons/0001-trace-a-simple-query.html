@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trace a Simple Query Through Turso</title>
+  <link rel="stylesheet" href="../assets/course.css">
+  <script src="../assets/quiz.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Lesson 1 · 8 minutes · architecture</p>
+    <h1>Trace one query</h1>
+    <p class="dek">By the end, you can follow <code>SELECT 42</code> from a PostgreSQL <code>Query</code> message to Turso core and back to PostgreSQL response frames.</p>
+  </header>
+
+  <section aria-labelledby="model-title">
+    <h2 id="model-title">The Mental Model</h2>
+    <p>The “PostgreSQL frontend” is not one crate. It is a pipeline around Turso core. The server speaks PostgreSQL to the client; the parser and translator adapt PostgreSQL SQL; core remains the execution engine.</p>
+    <ol class="pipeline">
+      <li><strong>Wire</strong><span>pgwire decodes <code>Q</code> and calls Turso</span></li>
+      <li><strong>Session</strong><span>split and prepare PG-aware SQL</span></li>
+      <li><strong>Translation</strong><span>PostgreSQL AST becomes Turso AST</span></li>
+      <li><strong>Execution</strong><span>core compiles and runs a statement</span></li>
+      <li><strong>Encoding</strong><span>rows become PG metadata and frames</span></li>
+    </ol>
+    <p class="source"><span class="source-label">Primary source</span><br>The PostgreSQL specification defines a simple query as a <code>Query</code> message followed by response messages and a final <code>ReadyForQuery</code>. Read <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY">Message Flow: Simple Query</a>.</p>
+  </section>
+
+  <section aria-labelledby="trace-title">
+    <h2 id="trace-title">Follow <code>SELECT 42</code></h2>
+    <p><strong>1. pgwire hands Turso a string.</strong> <a href="../postgres/server/lib.rs#L174"><code>TursoPgHandler::do_query</code></a> receives <code>&amp;str</code>. The byte-level <code>Q + length + SQL + NUL</code> parsing is owned by pgwire; Turso's raw test client constructs that exact frame in <a href="../postgres/cli/tests/tursopg.rs#L1037"><code>send_query</code></a>.</p>
+    <pre><code>// postgres/server/lib.rs
+let statements = split_statements(query)?;
+for sql in &amp;statements {
+    let mut stmt = conn.prepare(sql)?;
+    // classify, execute, encode
+}</code></pre>
+
+    <p><strong>2. The session builds a core statement.</strong> <a href="../postgres/frontend/session.rs#L169"><code>prepare_statement</code></a> checks frontend-only cases, calls <code>pg_query</code>, translates the result, applies <code>search_path</code>, runs any prerequisite statements, and asks core to prepare the translated command.</p>
+    <pre><code>PostgreSQL SQL
+  → pg_query::ParseResult
+  → PostgreSQLTranslator
+  → turso_parser::ast::Cmd
+  → turso_core::Statement</code></pre>
+    <p>The key distinction: <a href="../postgres/parser/translator.rs#L114"><code>translate_with_prereqs</code></a> adapts syntax trees. It does not execute SQL. The core boundary is <a href="../postgres/frontend/session.rs#L206"><code>prepare_translated_cmd_with_options</code></a>.</p>
+
+    <p><strong>3. The server turns core output back into PostgreSQL output.</strong> Because <code>SELECT 42</code> has a result column, <a href="../postgres/server/lib.rs#L287"><code>build_field_info</code></a> chooses its PostgreSQL type and <a href="../postgres/server/lib.rs#L384"><code>execute_query</code></a> runs the statement and encodes each value.</p>
+    <div class="wire-sequence" aria-label="Expected response sequence">
+      <span class="chip"><strong>T</strong> RowDescription · INT4</span>
+      <span class="chip"><strong>D</strong> DataRow · 42</span>
+      <span class="chip"><strong>C</strong> CommandComplete · SELECT 1</span>
+      <span class="chip"><strong>Z</strong> ReadyForQuery</span>
+    </div>
+    <p>The protocol meaning and byte layouts come from PostgreSQL's <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-ROWDESCRIPTION">RowDescription</a>, <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-DATAROW">DataRow</a>, and <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html#PROTOCOL-MESSAGE-FORMATS-READYFORQUERY">ReadyForQuery</a> definitions.</p>
+  </section>
+
+  <section class="callout" aria-labelledby="boundary-title">
+    <h2 id="boundary-title">Contributor Rule</h2>
+    <p>Classify the broken artifact before choosing a file:</p>
+    <p><code>bytes → SQL string → PG AST → Turso AST → core Statement → Turso row → PG response</code></p>
+    <p>The boundary where the artifact first becomes wrong is usually where the fix belongs. For example, a correct value with the wrong PostgreSQL OID points to <code>postgres/server</code>, not the translator or VDBE.</p>
+  </section>
+
+  <section class="exercise" data-quiz data-explanation="A correct runtime value means execution worked; build_field_info owns the PostgreSQL type metadata." aria-labelledby="quiz-title">
+    <h2 id="quiz-title">Retrieval Check</h2>
+    <p><code>SELECT 42</code> returns the value <code>42</code>, but the client sees the column type as <code>TEXT</code> instead of <code>INT4</code>. Where do you inspect first?</p>
+    <div class="quiz-options">
+      <button type="button" data-answer="correct">server metadata mapping</button>
+      <button type="button" data-answer="wrong">session special handling</button>
+      <button type="button" data-answer="wrong">parser syntax translation</button>
+      <button type="button" data-answer="wrong">core statement execution</button>
+    </div>
+    <p class="feedback" data-feedback aria-live="polite"></p>
+  </section>
+
+  <section aria-labelledby="practice-title">
+    <h2 id="practice-title">Make It Real</h2>
+    <p>Open these three call sites in order and explain aloud what artifact each returns:</p>
+    <ol>
+      <li><a href="../postgres/server/lib.rs#L174"><code>SimpleQueryHandler::do_query</code></a></li>
+      <li><a href="../postgres/frontend/session.rs#L169"><code>prepare_statement</code></a></li>
+      <li><a href="../postgres/server/lib.rs#L384"><code>execute_query</code></a></li>
+    </ol>
+    <p>Then close the lesson and reconstruct the five-stage pipeline from memory. That retrieval, not rereading, is what starts building durable recall.</p>
+  </section>
+
+  <section class="source" aria-labelledby="next-title">
+    <h2 id="next-title">Keep Nearby</h2>
+    <p>Use the printable <a href="../reference/postgres-frontend-map.html">PostgreSQL frontend map</a> while exploring issues. The best primary reading for this lesson is the short <a href="https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-SIMPLE-QUERY">PostgreSQL simple-query protocol section</a>.</p>
+    <p>Ask your teaching agent about any unclear boundary or paste a frontend issue you want to trace. Your explanation of the practice trace will also help set the difficulty of the next lesson.</p>
+  </section>
+
+  <nav aria-label="Course navigation">
+    <a href="0002-who-owns-the-query.html">Next: who owns the query?</a>
+    <a href="../reference/postgres-frontend-map.html">Quick reference</a>
+    <a href="../RESOURCES.md">Trusted resources</a>
+    <a href="../MISSION.md">Course mission</a>
+  </nav>
+</main>
+</body>
+</html>

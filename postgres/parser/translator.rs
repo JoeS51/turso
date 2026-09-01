@@ -2512,6 +2512,14 @@ impl PostgreSQLTranslator {
         }
     }
 
+    fn translate_row_expr(
+        &self,
+        row_expr: &pg_query::protobuf::RowExpr,
+    ) -> Result<ast::Expr, ParseError> {
+        // use ast parenthesized which is turso's version of rowexpr
+        todo!();
+    }
+
     fn translate_a_expr(
         &self,
         a_expr: &pg_query::protobuf::AExpr,
@@ -7392,5 +7400,12 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    #[test]
+    fn inspect_row_wise_comparison() {
+        let parsed = crate::parse("SELECT (1,2) > (2,3);").unwrap();
+
+        dbg!(&parsed.protobuf);
     }
 }
